@@ -22,6 +22,7 @@ import Cardano.Ledger.Hashes qualified as Ledger
 import Control.Monad.Error.Class (MonadError (..))
 import Data.ByteString.Base16 qualified as Base16
 import Data.Map qualified as Map
+import Data.Text (unpack)
 import Network.Wai qualified as Wai
 import Servant qualified
 import Servant.API
@@ -29,6 +30,7 @@ import Servant.API
   , FromHttpApiData
   , Get
   , Post
+  , QueryParam
   , ReqBody
   , ToHttpApiData (..)
   , type (:<|>) (..)
@@ -40,6 +42,8 @@ import Web.HttpApiData.Orphans ()
 import Yare.App.Services (Services (serveCollateralAddresses))
 import Yare.App.Services qualified as App
 import Yare.App.Services.DeployScript qualified as DeployScript
+import Yare.App.Services.Rebalancing (Amount (..), rebalanceDefaultAmount)
+import Yare.App.Services.Rebalancing qualified as Rebalance
 import Yare.Http.Address qualified as Http.Address
 import Yare.Http.Types qualified as Http
 import Yare.Utxo (ScriptDeployment (..))
@@ -69,6 +73,9 @@ type YareApi =
                   :<|> "change" :> Get '[JSON] [Http.Address]
                   :<|> "fees" :> Get '[JSON] [Http.Address]
                   :<|> "collateral" :> Get '[JSON] [Http.Address]
+                  :<|> "rebalance"
+                    :> QueryParam "amount" Amount
+                    :> Post '[JSON] ()
                   :<|> "scripts" :> Get '[JSON] [Http.Address]
                )
           :<|> "transactions"
@@ -99,6 +106,7 @@ application services =
               :<|> endpointAddressesChange services
               :<|> endpointAddressesFees services
               :<|> endpointAddressesCollateral services
+              :<|> (endpointAddressesRebalance services . fromMaybe rebalanceDefaultAmount)
               :<|> endpointAddressesScripts services
            )
       :<|> ( endpointTransactions services
@@ -149,7 +157,7 @@ endpointScriptDeployments App.Services {serveScriptDeployments} = liftIO do
   pure $ uncurry Http.ScriptDeployment <$> Map.toList deployments
 
 endpointScriptDeployment
-  ∷ Services IO
+  ∷ App.Services IO
   → ScriptHash
   → Servant.Handler Http.ScriptDeployment
 endpointScriptDeployment services scriptHash = do
@@ -174,6 +182,14 @@ endpointAddressesFees App.Services {serveFeeAddresses} = liftIO do
 endpointAddressesCollateral ∷ App.Services IO → Servant.Handler [Http.Address]
 endpointAddressesCollateral App.Services {serveCollateralAddresses} = liftIO do
   Http.Address.fromLedgerAddress <<$>> serveCollateralAddresses
+
+endpointAddressesRebalance
+  ∷ App.Services IO
+  → Rebalance.Amount
+  → Servant.Handler ()
+endpointAddressesRebalance services =
+  let App.Services {requestRebalancing} = services
+   in liftIO . requestRebalancing
 
 endpointAddressesScripts ∷ App.Services IO → Servant.Handler [Http.Address]
 endpointAddressesScripts App.Services {serveScriptAddresses} = liftIO do
@@ -203,6 +219,11 @@ endpointNftMint App.Services {requestMinting} asset = liftIO do
 
 instance ToHttpApiData ScriptHash where
   toUrlPiece (ScriptHash (Ledger.ScriptHash h)) = toUrlPiece (hashToTextAsHex h)
+
+instance FromHttpApiData Amount where
+  parseUrlPiece t = case readMaybe (unpack t) of
+    Just n → Right $ Amount n
+    Nothing → Left $ "parseUrlPiece: was expecting an integer, but got: " <> t
 
 instance FromHttpApiData ScriptHash where
   parseUrlPiece =
