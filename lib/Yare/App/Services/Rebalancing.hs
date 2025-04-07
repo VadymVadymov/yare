@@ -7,30 +7,38 @@ module Yare.App.Services.Rebalancing
 
 import Yare.Prelude
 
-import Cardano.Api (inAnyShelleyBasedEra)
+import Cardano.Api (inAnyShelleyBasedEra, setTxIns)
 import Cardano.Api.Shelley
   ( AddressInEra
+  , AlonzoEraOnwards (..)
   , BuildTx
-  , ConwayEraOnwards
+  , BuildTxWith (..)
+  , ConwayEraOnwards (..)
+  , KeyWitnessInCtx (KeyWitnessForSpending)
   , LedgerProtocolParameters (..)
   , Lovelace
   , ShelleyBasedEra
   , Tx (..)
   , TxBodyContent
   , TxInMode (..)
+  , TxInsCollateral (..)
   , UTxO
+  , Witness (KeyWitness)
   , constructBalancedTx
   , convert
   , defaultTxBodyContent
   , fromShelleyAddrIsSbe
   , runExcept
   , selectLovelace
+  , setTxInsCollateral
+  , setTxOuts
+  , setTxProtocolParams
   )
 import Control.Exception (throwIO)
+import Control.Exception.Base (throw)
 import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (Except)
-import Data.Aeson (ToJSON (toJSON))
-import Data.Aeson.Types (KeyValue ((.=)), object)
+import Data.Aeson.Types (ToJSON)
 import Data.Map.Strict qualified as Map
 import Text.Pretty.Simple (pShow)
 import Yare.Address (AddressWithKey, Addresses (externalAddresses))
@@ -44,9 +52,6 @@ import Yare.Util.State (usingMonadState)
 import Yare.Util.Tx.Construction (mkCardanoApiUtxo, witnessUtxoEntry)
 import Yare.Utxo (Utxo, spendableEntries)
 import Yare.Utxo qualified as Utxo
-
-instance ToJSON Error where
-  toJSON err = object ["error" .= err]
 
 {- | Used for specifying the amount of addresses to be balanced.
 First n addresses will be taken (in the order of derivation from mnemonic).
@@ -103,12 +108,12 @@ rebalance env (Amount amount) = do
     epoch = epochInfo network
     protocolParams = protocolParameters network
     shelleyBasedEra ∷ ShelleyBasedEra era = convert era
-    allAddresses = toList (externalAddresses (look @Addresses env))
-    rebalancingAddresses ∷ [AddressWithKey] =
-      take (min amount (length allAddresses)) allAddresses
 
-    bodyContent ∷ TxBodyContent BuildTx era =
-      defaultTxBodyContent shelleyBasedEra & _
+    allAddresses = toList (externalAddresses (look @Addresses env))
+    rebalancingAddresses ∷ NonEmpty AddressWithKey =
+      case take (min amount (length allAddresses)) allAddresses of
+        [] → throw NoAddressesToRebalance
+        x : xs → x :| xs
 
     changeAddress ∷ AddressInEra era =
       fromShelleyAddrIsSbe shelleyBasedEra . ledgerAddress $
@@ -124,11 +129,34 @@ rebalance env (Amount amount) = do
 
   totalLovelaceBalance ∷ Lovelace ←
     usingMonadState (calculateTotalBalance rebalancingAddresses)
+      >>= maybe (throwError CalculateTotalBalanceError) pure
+
+  rebalanceEntries ∷ [Utxo.Entry] ←
+    usingMonadState (Utxo.useInputsWithAddresses rebalancingAddresses)
       >>= maybe (throwError (RebalancingTxError NoCollateralInputs)) pure
 
   let
+    txIns =
+      (,BuildTxWith (KeyWitness KeyWitnessForSpending)) . Utxo.utxoEntryInput
+        <$> utxoEntryForFee : rebalanceEntries
+
+    txInsCollateral ∷ TxInsCollateral era =
+      case era of
+        ConwayEraOnwardsConway →
+          TxInsCollateral
+            AlonzoEraOnwardsConway
+            [Utxo.utxoEntryInput utxoEntryForCollateral]
+
+    bodyContent ∷ TxBodyContent BuildTx era =
+      defaultTxBodyContent shelleyBasedEra
+        & setTxIns txIns
+        & setTxOuts _
+        & setTxInsCollateral txInsCollateral
+        & setTxProtocolParams
+          (BuildTxWith (Just (LedgerProtocolParameters protocolParams)))
+
     inputsForBalancing ∷ UTxO era =
-      mkCardanoApiUtxo era [utxoEntryForFee, utxoEntryForCollateral] <> _
+      mkCardanoApiUtxo era ([utxoEntryForFee, utxoEntryForCollateral] <> rebalanceEntries)
 
     wrapError =
       RebalancingTxError
@@ -152,7 +180,7 @@ rebalance env (Amount amount) = do
       , witnessUtxoEntry utxoEntryForCollateral
       ]
 
-calculateTotalBalance ∷ [AddressWithKey] → Utxo → Maybe (Utxo, Lovelace)
+calculateTotalBalance ∷ NonEmpty AddressWithKey → Utxo → Maybe (Utxo, Lovelace)
 calculateTotalBalance addresses utxo = Just (utxo, totalBalance)
  where
   totalBalance = selectLovelace $ Map.foldr' f mempty (spendableEntries utxo)
@@ -160,6 +188,9 @@ calculateTotalBalance addresses utxo = Just (utxo, totalBalance)
     | addr `elem` (ledgerAddress <$> addresses) = acc <> value
     | otherwise = acc
 
-newtype Error = RebalancingTxError TxConstructionError
+data Error
+  = RebalancingTxError TxConstructionError
+  | CalculateTotalBalanceError
+  | NoAddressesToRebalance
   deriving anyclass (Exception)
   deriving stock (Show)

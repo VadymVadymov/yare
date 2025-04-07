@@ -177,6 +177,25 @@ useInputWithAddress utxo MkAddressWithKey {..} = do
   let utxo'' = utxo' {usedInputs = Set.insert utxoEntryInput (usedInputs utxo')}
   pure (utxo'', entry)
 
+useInputsWithAddresses ∷ NonEmpty AddressWithKey → Utxo → Maybe (Utxo, [Entry])
+useInputsWithAddresses addresses u = pure $ foldl' g (u, []) addresses
+ where
+  g (utxo, entries) MkAddressWithKey {ledgerAddress, paymentKey} = do
+    let
+      (utxo', usedByAddress) = useByAddress utxo ledgerAddress
+      newEntries = do
+        (utxoEntryInput, (addr, utxoEntryValue)) ← usedByAddress
+        guard (addr == ledgerAddress)
+          $> MkEntry
+            { utxoEntryInput
+            , utxoEntryValue
+            , utxoEntryKey = paymentKey
+            , utxoEntryAddress = ledgerAddress
+            }
+      newInputs = utxoEntryInput <$> newEntries
+      utxo'' = utxo' {usedInputs = Set.fromList newInputs <> usedInputs utxo'}
+    (utxo'', entries <> newEntries)
+
 useInputLowestAdaOnly
   ∷ HasCallStack
   ⇒ Addresses
